@@ -1,4 +1,4 @@
-# claude-sessions
+# tmux-claude-sessions
 
 Search every [Claude Code](https://claude.com/claude-code) session on your machine — by title,
 by what was said, or by what it was *about* — and resume it in a new tmux window.
@@ -15,8 +15,8 @@ by what was said, or by what it was *about* — and resume it in a new tmux wind
 - **Preview** of the conversation — only what you and Claude wrote, no tool output — opened at
   the best-matching exchange, with your search terms highlighted.
 - **Enter resumes** the session in a new tmux window in the session's project folder. If the
-  session is already open in a pane (via [tmux-claude-tasks](https://github.com/dodokr/tmux-claude-tasks)),
-  Enter jumps there instead of opening a second copy.
+  session is already open in a pane, Enter jumps there instead of opening a second copy (needs
+  tmux-claude-tasks, see below).
 - **No daemon.** A Claude Code `SessionEnd` hook and the picker itself keep the index fresh;
   only changed transcripts are re-read, and only new text is embedded.
 
@@ -31,13 +31,18 @@ by what was said, or by what it was *about* — and resume it in a new tmux wind
   ollama pull embeddinggemma   # ~600 MB, multilingual
   ```
 
+- Optional: [tmux-claude-tasks](https://github.com/dodokr/tmux-claude-tasks), a status board of
+  the Claude sessions running in tmux right now. `claude-sessions` works fully without it; with
+  it installed you also get the green `●` for open sessions, Enter jumping to an open session's
+  pane instead of resuming a second copy, and `Ctrl-T` / `s` to switch between the two pickers.
+
 ## Install
 
 1. **Put the script on your `PATH`:**
 
    ```sh
-   git clone https://github.com/dodokr/claude-sessions.git
-   ln -s "$PWD/claude-sessions/claude-sessions" ~/.local/bin/claude-sessions
+   git clone https://github.com/dodokr/tmux-claude-sessions.git
+   ln -s "$PWD/tmux-claude-sessions/claude-sessions" ~/.local/bin/claude-sessions
    ```
 
 2. **Build the index** (prints progress; the first embedding pass is the slow part, see
