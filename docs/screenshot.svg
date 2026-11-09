@@ -1,10 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="939" height="518" viewBox="0 0 939 518">
 <rect width="939" height="518" rx="8" fill="#1e1e2e"/>
 <g font-family="JetBrains Mono, Menlo, Consolas, monospace" font-size="14">
-<text x="16.0" y="29" fill="#5f5f5f">╭────────────────────────────────────────────</text>
-<text x="402.4" y="29" fill="#afafaf">Claude</text>
-<text x="461.2" y="29" fill="#afafaf">sessions</text>
-<text x="536.8" y="29" fill="#5f5f5f">─────────────────────────────────────────────╮</text>
+<text x="16.0" y="29" fill="#5f5f5f">╭─────────────────────────────────────────</text>
+<text x="377.2" y="29" fill="#afafaf">Claude</text>
+<text x="436.0" y="29" fill="#afafaf">session</text>
+<text x="503.2" y="29" fill="#afafaf">search</text>
+<text x="562.0" y="29" fill="#5f5f5f">──────────────────────────────────────────╮</text>
 <text x="16.0" y="47" fill="#cdd6f4">│</text>
 <text x="49.6" y="47" fill="#87afaf">C-s</text>
 <text x="83.2" y="47" fill="#87afaf">semantic</text>
@@ -38,28 +39,29 @@
 <rect x="32.8" y="88" width="8.4" height="18" fill="#303030"/>
 <text x="32.8" y="101" fill="#d7005f" font-weight="bold">▌</text>
 <rect x="41.2" y="88" width="8.4" height="18" fill="#303030"/>
-<rect x="49.6" y="88" width="420.0" height="18" fill="#303030"/>
+<rect x="49.6" y="88" width="512.4" height="18" fill="#303030"/>
 <text x="66.4" y="101" fill="#e4e4e4" font-weight="bold">Bluetooth</text>
 <text x="150.4" y="101" fill="#e4e4e4" font-weight="bold">RC</text>
 <text x="175.6" y="101" fill="#e4e4e4" font-weight="bold">car</text>
 <text x="209.2" y="101" fill="#e4e4e4" font-weight="bold">controller</text>
 <text x="301.6" y="101" fill="#e4e4e4" font-weight="bold">in</text>
 <text x="326.8" y="101" fill="#e4e4e4" font-weight="bold">Rust</text>
-<rect x="469.6" y="88" width="151.2" height="18" fill="#303030"/>
-<text x="469.6" y="101" fill="#94e2d5" font-weight="bold">rc-car</text>
-<rect x="620.8" y="88" width="8.4" height="18" fill="#303030"/>
-<rect x="629.2" y="88" width="142.8" height="18" fill="#303030"/>
-<text x="629.2" y="101" fill="#7f849c" font-weight="bold">main</text>
-<text x="755.2" y="101" fill="#7f849c" font-weight="bold">2h</text>
+<rect x="562.0" y="88" width="151.2" height="18" fill="#303030"/>
+<text x="562.0" y="101" fill="#94e2d5" font-weight="bold">rc-car</text>
+<rect x="713.2" y="88" width="8.4" height="18" fill="#303030"/>
+<rect x="721.6" y="88" width="142.8" height="18" fill="#303030"/>
+<text x="721.6" y="101" fill="#7f849c" font-weight="bold">main</text>
+<text x="847.6" y="101" fill="#7f849c" font-weight="bold">2h</text>
+<rect x="864.4" y="88" width="42.0" height="18" fill="#303030"/>
 <text x="914.8" y="101" fill="#5f5f5f">│</text>
 <text x="16.0" y="119" fill="#cdd6f4">│</text>
 <text x="66.4" y="119" fill="#cdd6f4">Car</text>
 <text x="100.0" y="119" fill="#cdd6f4">rental</text>
 <text x="158.8" y="119" fill="#cdd6f4">price</text>
 <text x="209.2" y="119" fill="#cdd6f4">scraper</text>
-<text x="469.6" y="119" fill="#94e2d5">scraper</text>
-<text x="629.2" y="119" fill="#7f849c">main</text>
-<text x="755.2" y="119" fill="#7f849c">2d</text>
+<text x="562.0" y="119" fill="#94e2d5">scraper</text>
+<text x="721.6" y="119" fill="#7f849c">main</text>
+<text x="847.6" y="119" fill="#7f849c">2d</text>
 <text x="914.8" y="119" fill="#5f5f5f">│</text>
 <text x="16.0" y="137" fill="#cdd6f4">│</text>
 <text x="49.6" y="137" fill="#a6e3a1">●</text>
@@ -67,9 +69,9 @@
 <text x="150.4" y="137" fill="#cdd6f4">headphones</text>
 <text x="242.8" y="137" fill="#cdd6f4">keep</text>
 <text x="284.8" y="137" fill="#cdd6f4">disconnecting</text>
-<text x="469.6" y="137" fill="#94e2d5">dotfiles</text>
-<text x="629.2" y="137" fill="#7f849c">main</text>
-<text x="755.2" y="137" fill="#7f849c">4m</text>
+<text x="562.0" y="137" fill="#94e2d5">dotfiles</text>
+<text x="721.6" y="137" fill="#7f849c">main</text>
+<text x="847.6" y="137" fill="#7f849c">4m</text>
 <text x="914.8" y="137" fill="#5f5f5f">│</text>
 <text x="16.0" y="155" fill="#cdd6f4">│</text>
 <text x="66.4" y="155" fill="#7f849c" font-style="italic">how</text>
@@ -80,10 +82,13 @@
 <text x="200.8" y="155" fill="#7f849c" font-style="italic">ps4</text>
 <text x="234.4" y="155" fill="#7f849c" font-style="italic">controller</text>
 <text x="326.8" y="155" fill="#7f849c" font-style="italic">over</text>
-<text x="368.8" y="155" fill="#7f849c" font-style="italic">bluetooth…</text>
-<text x="469.6" y="155" fill="#94e2d5">dotfiles</text>
-<text x="629.2" y="155" fill="#7f849c">main</text>
-<text x="755.2" y="155" fill="#7f849c">1d</text>
+<text x="368.8" y="155" fill="#7f849c" font-style="italic">bluetooth</text>
+<text x="452.8" y="155" fill="#7f849c" font-style="italic">on</text>
+<text x="478.0" y="155" fill="#7f849c" font-style="italic">linux</text>
+<text x="528.4" y="155" fill="#7f849c" font-style="italic">a…</text>
+<text x="562.0" y="155" fill="#94e2d5">dotfiles</text>
+<text x="721.6" y="155" fill="#7f849c">main</text>
+<text x="847.6" y="155" fill="#7f849c">1d</text>
 <text x="914.8" y="155" fill="#5f5f5f">│</text>
 <text x="16.0" y="173" fill="#cdd6f4">│</text>
 <text x="914.8" y="173" fill="#5f5f5f">│</text>
