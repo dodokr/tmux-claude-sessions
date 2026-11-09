@@ -279,6 +279,14 @@ class SearchTest(Base):
         self.assertIn("cars", self.ids(cs.keyword_rank(self.db, "listings ")))
         self.assertEqual(self.ids(cs.keyword_rank(self.db, "planujem")), ["travel"])
 
+    def test_title_match_previews_best_exchange(self):
+        self.write("rc", [user("set up a rust project"), assistant(("text", "done")),
+                          user("drive it over bluetooth"), assistant(("text", "added BLE")),
+                          {"type": "ai-title", "aiTitle": "Bluetooth RC car"}])
+        cs.update_text(self.db)
+        self.assertEqual(dict(cs.keyword_rank(self.db, "bluetooth"))["rc"], 1)
+        self.assertEqual(dict(cs.keyword_rank(self.db, "rc "))["rc"], 0)  # title only
+
     def test_title_and_path_searchable(self):
         self.assertEqual(self.ids(cs.keyword_rank(self.db, "outline")), ["titled"])
         self.assertEqual(set(self.ids(cs.keyword_rank(self.db, "proj "))), {"shell", "cars", "titled"})

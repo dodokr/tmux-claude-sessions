@@ -356,13 +356,16 @@ def keyword_rank(db, query):
     expr = fts_expr(query)
     if not expr:
         return []
-    best = {}
+    best = {}  # session -> best exchange; insertion order is the session ranking
     for sid, ord_ in db.execute(
         "SELECT t.session, t.ord FROM turns_fts JOIN turns t ON t.id = turns_fts.rowid "
         "WHERE turns_fts MATCH ? ORDER BY bm25(turns_fts, 1.0, 0.6, 2.0) LIMIT 5000", (expr,)
     ):
-        best.setdefault(sid, max(ord_, 0))
-    return list(best.items())
+        # A title match (ord -1) ranks the session, but the preview should open at the best
+        # matching exchange of the conversation itself, if any.
+        if best.get(sid, -1) == -1:
+            best[sid] = ord_
+    return [(sid, max(ord_, 0)) for sid, ord_ in best.items()]
 
 
 def semantic_rank(db, query, limit=100):
