@@ -8,7 +8,7 @@ by what was said, or by what it was *about* — and resume it in a new tmux wind
 `~/.claude/projects` and gives you one fzf picker over them:
 
 - **Keyword search as you type** — SQLite FTS5 with BM25 ranking, stemming, accent-insensitive
-  (`cestovanie` finds `cestovánie`), prefix match on the word you are typing.
+  (`saris` finds `šariš`), prefix match on the word you are typing.
 - **Semantic search on demand** (`Ctrl-S`) — a local [ollama](https://ollama.com) embedding
   model finds "the bluetooth toy car thing" even if the session never said those words. Results
   are fused with the keyword ranking (reciprocal rank fusion).
