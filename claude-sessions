@@ -410,14 +410,26 @@ def hybrid_rank(db, query):
     return [(sid, where[sid][1]) for sid in sorted(score, key=lambda s: -score[s])]
 
 
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "xonsh", "elvish"}
+
+
 def live_panes():
-    """{session id: tmux pane} for sessions claude-tasks reports as open."""
+    """{session id: (pane id, "session:window.pane")} for sessions claude-tasks reports open."""
     try:
         files = list(TASKS.iterdir())
-        panes = set(subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
-                                   capture_output=True, text=True, timeout=2).stdout.split())
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}"],
+            capture_output=True, text=True, timeout=2).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
+    # A pane back at a shell prompt no longer runs Claude, even if claude-tasks still lists it
+    # (e.g. Claude was killed before its SessionEnd hook ran).
+    panes = {}
+    for line in out.splitlines():
+        pane, target, command = (line.split("\t") + ["", ""])[:3]
+        if command not in SHELLS:
+            panes[pane] = target
     live = {}
     for f in files:
         try:
@@ -426,7 +438,7 @@ def live_panes():
             continue
         pane = "%" + f.name
         if len(fields) >= 4 and fields[3] and pane in panes:
-            live[fields[3]] = pane
+            live[fields[3]] = (pane, panes[pane])
     return live
 
 
@@ -463,6 +475,15 @@ def short_path(p):
 
 
 TITLE_STYLE = {"custom": "1", "ai": "0", "prompt": "3;90"}
+OTHER_COLUMNS = 40  # marker, project, branch, age and the gaps between them
+
+
+def title_width():
+    """Widest the title may be: what the list has left; fzf tells reloads its size in FZF_COLUMNS."""
+    cols = int(os.environ.get("FZF_COLUMNS") or shutil.get_terminal_size().columns)
+    if cols >= 184:  # the preview sits on the right (see --preview-window) and takes half
+        cols //= 2
+    return max(24, min(cols - 7 - OTHER_COLUMNS, 90))
 
 
 def rows(db, ranked=None):
@@ -473,19 +494,21 @@ def rows(db, ranked=None):
     if ranked is None:
         ranked = [(sid, 0) for sid in sessions]
     here = os.environ.get("CLAUDE_SESSIONS_HERE")
+    shown = [(sessions[sid], ord_) for sid, ord_ in ranked if sid in sessions]
+    if here:
+        shown = [(s, o) for s, o in shown
+                 if s[1] == here or (s[1] or "").startswith(here.rstrip("/") + "/")]
+    if not shown:
+        return []
+    # Columns hug the longest title shown, so short titles don't leave a gap before the project.
+    tw = min(title_width(), max(24, max(width(" ".join(s[3].split())) for s, _ in shown)))
     live = live_panes()
     out = []
-    for sid, ord_ in ranked:
-        s = sessions.get(sid)
-        if not s:
-            continue
-        _, cwd, branch, title, kind, active = s
-        if here and not (cwd == here or (cwd or "").startswith(here.rstrip("/") + "/")):
-            continue
+    for (sid, cwd, branch, title, kind, active), ord_ in shown:
         mark = "\x1b[32m●\x1b[0m" if sid in live else " "
         branch = "" if branch in (None, "HEAD") else branch
         out.append(
-            f"{sid}\t{ord_}\t{mark} \x1b[{TITLE_STYLE.get(kind, '0')}m{fit(title, 46)}\x1b[0m  "
+            f"{sid}\t{ord_}\t{mark} \x1b[{TITLE_STYLE.get(kind, '0')}m{fit(title, tw)}\x1b[0m  "
             f"\x1b[36m{fit(os.path.basename(cwd or '?'), 18)}\x1b[0m "
             f"\x1b[90m{fit(branch, 12)} {ago(active):>4}\x1b[0m"
         )
@@ -521,8 +544,8 @@ def preview(db, sid, start=0, query=""):
     if branch and branch != "HEAD":
         info.append(branch)
     info += [f"{prompts} prompts", f"started {(started or '?')[:10]}", f"active {ago(active)} ago"]
-    if pane := live_panes().get(sid):
-        info.append(f"\x1b[32mopen in {pane}\x1b[90m")
+    if sid in (live := live_panes()):
+        info.append(f"\x1b[32mopen in {live[sid][1]}\x1b[90m")
     print(f"\x1b[1m{hl(title)}\x1b[0m\n\x1b[90m{'  ·  '.join(info)}\n{sid}\x1b[0m")
     first = max(start - 1, 0)  # one exchange of context before the match
     if first:
@@ -547,7 +570,8 @@ def open_session(db, sid):
     row = db.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
     if not row:
         sys.exit(f"claude-sessions: unknown session {sid}")
-    if pane := live_panes().get(sid):
+    if sid in (live := live_panes()):
+        pane = live[sid][0]
         tmux("switch-client", "-t", pane, ";", "select-window", "-t", pane, ";", "select-pane", "-t", pane)
         return
     cwd = row[0]
@@ -609,17 +633,17 @@ def picker(here):
         f"change:reload({me} search -- {{q}})+change-prompt(> )",
         f"ctrl-s:reload({me} search --semantic -- {{q}})+change-prompt(≈ )",
         f"enter:become({me} open {{1}})",
-        f"ctrl-y:execute-silent({me} copy {{1}})+change-border-label( Claude sessions · copied )",
+        f"ctrl-y:execute-silent({me} copy {{1}})+change-border-label( Claude session search · copied )",
         "ctrl-/:toggle-preview",
         "ctrl-f:preview-page-down,ctrl-b:preview-page-up",
     ]
     if shutil.which("claude-tasks"):
         binds.append("ctrl-t:become(claude-tasks)")
         keys = keys.replace(" · Esc", " · C-t tasks · Esc")
-    label = " Claude sessions" + (f" in {short_path(os.getcwd())} " if here else " ")
+    label = " Claude session search" + (f" in {short_path(os.getcwd())} " if here else " ")
     args = [
         "fzf", "--ansi", "--disabled", "--no-sort", "--delimiter=\t", "--with-nth=3",
-        "--layout=reverse", "--border=rounded", f"--border-label={label}",
+        "--layout=reverse", "--border=rounded", f"--border-label={label}", "--highlight-line",
         f"--header={keys}", "--header-first", "--info=inline-right", "--pointer=▌",
         "--gutter= ", "--prompt=> ", "--with-shell=bash -c",
         f"--preview={me} preview {{1}} {{2}} {{q}}",

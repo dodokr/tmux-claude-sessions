@@ -338,6 +338,22 @@ class SearchTest(Base):
         finally:
             del os.environ["CLAUDE_SESSIONS_HERE"]
 
+    def test_title_column_fills_the_list(self):
+        os.environ["FZF_COLUMNS"] = "120"
+        try:
+            self.assertEqual(cs.title_width(), 120 - 7 - cs.OTHER_COLUMNS)
+            os.environ["FZF_COLUMNS"] = "60"
+            self.assertEqual(cs.title_width(), 24)  # never narrower than this
+            os.environ["FZF_COLUMNS"] = "400"
+            self.assertEqual(cs.title_width(), 90)  # preview on the right; capped
+            # The column itself is only as wide as the longest title shown (but at least 24).
+            plain = [re.sub(r"\x1b\[[0-9;]*m", "", line.split("\t")[2]) for line in cs.rows(self.db)]
+            longest = max(len(t) for (t,) in self.db.execute("SELECT title FROM sessions"))
+            self.assertGreater(longest, 24)
+            self.assertEqual({cs.width(p) for p in plain}, {longest + cs.OTHER_COLUMNS})
+        finally:
+            del os.environ["FZF_COLUMNS"]
+
     def test_fit_handles_wide_characters(self):
         self.assertEqual(cs.width(cs.fit("日本語のセッション名前です", 10)), 10)
         self.assertEqual(cs.fit("ab", 4), "ab  ")
@@ -356,17 +372,35 @@ class LiveAndOpenTest(Base):
         log = self.root / "tmux.log"
         return log.read_text() if log.exists() else ""
 
+    def panes(self, *rows):
+        (self.root / "panes").write_text("".join("\t".join(r) + "\n" for r in rows))
+
     def test_live_panes_from_claude_tasks(self):
-        (self.root / "panes").write_text("%5\n%6\n")
+        self.panes(("%5", "work:1.1", "claude"), ("%6", "work:2.1", "claude"))
         (self.root / "tasks/5").write_text("running\t1\t/x\ts1\n")
         (self.root / "tasks/6").write_text("idle\t1\t/x\n")  # old 3-field format
         (self.root / "tasks/7").write_text("done\t1\t/x\ts2\n")  # pane closed
-        self.assertEqual(cs.live_panes(), {"s1": "%5"})
+        self.assertEqual(cs.live_panes(), {"s1": ("%5", "work:1.1")})
         marks = {line.split("\t")[0]: "●" in line for line in cs.rows(self.db)}
         self.assertEqual(marks, {"s1": True, "s2": False})
 
+    def test_pane_back_at_shell_prompt_is_not_live(self):
+        self.panes(("%5", "work:1.1", "fish"), ("%6", "work:2.1", "node"))
+        (self.root / "tasks/5").write_text("done\t1\t/x\ts1\n")
+        (self.root / "tasks/6").write_text("done\t1\t/x\ts2\n")
+        self.assertEqual(cs.live_panes(), {"s2": ("%6", "work:2.1")})
+
+    def test_preview_names_the_pane_target(self):
+        self.panes(("%5", "work:3.2", "claude"))
+        (self.root / "tasks/5").write_text("running\t1\t/x\ts1\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.preview(self.db, "s1")
+        self.assertIn("open in work:3.2", out.getvalue())
+        self.assertNotIn("%5", out.getvalue())
+
     def test_open_live_session_jumps(self):
-        (self.root / "panes").write_text("%5\n")
+        self.panes(("%5", "work:1.1", "claude"))
         (self.root / "tasks/5").write_text("running\t1\t/x\ts1\n")
         cs.open_session(self.db, "s1")
         self.assertIn("switch-client -t %5", self.tmux_log())
