@@ -7,6 +7,10 @@ by what was said, or by what it was *about* — and resume it in a new tmux wind
 ("Untitled", or a summary of the first prompt). `claude-sessions` indexes all transcripts in
 `~/.claude/projects` and gives you one fzf picker over them:
 
+![claude-sessions picker](docs/screenshot.svg)
+
+*(Screenshot rendered from `scripts/demo.sh`, which uses made-up sessions.)*
+
 - **Keyword search as you type** — SQLite FTS5 with BM25 ranking, stemming, accent-insensitive
   (`saris` finds `šariš`), prefix match on the word you are typing.
 - **Semantic search on demand** (`Ctrl-S`) — a local [ollama](https://ollama.com) embedding
@@ -148,9 +152,12 @@ warm. While a large embedding pass is running, a semantic search waits for the c
 
 ```sh
 python3 -m unittest discover tests   # synthetic transcripts, a fake ollama and a fake tmux
+scripts/demo.sh                      # try the picker on an isolated tmux server with fake sessions
+CAPTURE_ANSI=1 scripts/demo.sh --capture | scripts/ansi2svg.py > docs/screenshot.svg
 ```
 
-The tests never read your real sessions or call a real model.
+The tests and the demo never read your real sessions, index or tmux, and never call a real
+model: the demo runs on its own tmux socket with temporary transcripts and semantic search off.
 
 ## License
 
