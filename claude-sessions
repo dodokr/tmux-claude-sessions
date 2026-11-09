@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Search every Claude Code session on this machine and resume one in tmux.
+
+    claude-sessions [--here]            open the picker (meant for: tmux display-popup -E)
+    claude-sessions search [-s] QUERY   print matching sessions; -s adds semantic ranking
+    claude-sessions preview ID [N [Q]]  print a session's conversation from exchange N
+    claude-sessions open ID             resume a session in a new tmux window (or jump to it)
+    claude-sessions index [-q]          update the index: text, then embeddings via ollama
+    claude-sessions hook                Claude Code hook: update the index in the background
+    claude-sessions status              show what is indexed
+
+Sessions are read from ~/.claude/projects (or $CLAUDE_CONFIG_DIR/projects). The index is one
+SQLite database in $CLAUDE_SESSIONS_DIR (default $XDG_STATE_HOME/claude-sessions). Keyword
+search is SQLite FTS5 (BM25); semantic search uses a local ollama embedding model
+($CLAUDE_SESSIONS_MODEL, default embeddinggemma; "none" turns it off). Sessions resume with
+$CLAUDE_SESSIONS_RESUME (default "claude --resume {id}").
+"""
+
+import fcntl
+import hashlib
+import json
+import operator
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+from array import array
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+STATE = Path(os.environ.get("CLAUDE_SESSIONS_DIR") or XDG_STATE / "claude-sessions")
+TASKS = Path(os.environ.get("CLAUDE_TASKS_DIR") or XDG_STATE / "claude-tasks")
+MODEL = os.environ.get("CLAUDE_SESSIONS_MODEL", "embeddinggemma")
+if MODEL.lower() in ("", "none", "off"):
+    MODEL = None
+OLLAMA = os.environ.get("OLLAMA_HOST") or "localhost:11434"
+if "://" not in OLLAMA:
+    OLLAMA = "http://" + OLLAMA.replace("0.0.0.0", "localhost")
+# How to resume a session; runs in your shell, so functions and abbreviations work.
+RESUME = os.environ.get("CLAUDE_SESSIONS_RESUME") or "claude --resume {id}"
+SELF = os.path.realpath(__file__)
+
+SCHEMA_VERSION = 2
+WINDOW, OVERLAP, MAX_WINDOWS = 1500, 200, 8  # chars per embedded piece of an exchange
+BATCH = 8  # texts per ollama request; small so a search never waits long behind one
+RRF_K = 60  # reciprocal rank fusion constant
+
+SCHEMA = """
+-- mtime/size only detect changes: syncing or copying transcripts rewrites them, so the
+-- last message's timestamp (active) is what "how long ago" means.
+CREATE TABLE sessions(
+    id TEXT PRIMARY KEY, path TEXT, mtime REAL, size INTEGER, cwd TEXT, branch TEXT,
+    title TEXT, title_kind TEXT, started TEXT, active REAL, prompts INTEGER, hidden INTEGER);
+-- One row per exchange (a prompt and Claude's text replies to it). ord -1 holds the
+-- session's title, path and branch so those are searchable too.
+CREATE TABLE turns(
+    id INTEGER PRIMARY KEY, session TEXT, ord INTEGER, prompt TEXT, reply TEXT, meta TEXT);
+CREATE INDEX turns_session ON turns(session, ord);
+CREATE VIRTUAL TABLE turns_fts USING fts5(
+    prompt, reply, meta, content=turns, content_rowid=id,
+    tokenize='porter unicode61 remove_diacritics 2');
+CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN
+    INSERT INTO turns_fts(rowid, prompt, reply, meta)
+    VALUES (new.id, new.prompt, new.reply, new.meta);
+END;
+CREATE TRIGGER turns_ad AFTER DELETE ON turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, prompt, reply, meta)
+    VALUES ('delete', old.id, old.prompt, old.reply, old.meta);
+END;
+-- Embedding inputs; vectors are keyed by input hash so unchanged text is never re-embedded.
+CREATE TABLE pieces(turn INTEGER, hash TEXT, input TEXT);
+CREATE INDEX pieces_turn ON pieces(turn);
+CREATE INDEX pieces_hash ON pieces(hash);
+CREATE TABLE IF NOT EXISTS vectors(hash TEXT, model TEXT, vec BLOB, PRIMARY KEY (hash, model));
+"""
+
+
+class EmbedError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- reading sessions
+
+SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+PASTE_TAG = re.compile(r"</?pasted_content[^>]*>")
+COMMAND = re.compile(r"<command-name>(.*?)</command-name>.*?<command-args>(.*?)</command-args>", re.S)
+BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
+# Output of slash/bang commands and notifications: not something you or Claude wrote.
+NOISE = re.compile(
+    r"\s*(<(local-command-\w+|bash-std\w+|task-notification|command-message)\b"
+    r"|\[Request interrupted by user)"
+)
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def clean_prompt(text):
+    text = SYSTEM_REMINDER.sub("", text)
+    if m := COMMAND.search(text):
+        name, args = m.group(1).strip(), m.group(2).strip()
+        return f"{name} {args}" if args else ""  # bare /clear, /model, ... carry no content
+    if m := BASH_INPUT.search(text):
+        return "! " + m.group(1).strip()
+    if NOISE.match(text):
+        return ""
+    return PASTE_TAG.sub("", text).strip()
+
+
+def parse(path):
+    """Read a session transcript into metadata and a list of (prompt, reply) exchanges."""
+    meta = {"cwd": None, "branch": None, "started": None, "last": None, "entrypoint": None}
+    titles = {}
+    turns = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue  # e.g. a half-written last line
+            if not isinstance(r, dict):
+                continue
+            kind = r.get("type")
+            if kind == "custom-title" and r.get("customTitle"):
+                titles["custom"] = r["customTitle"]
+            elif kind == "ai-title" and r.get("aiTitle"):
+                titles["ai"] = r["aiTitle"]
+            elif kind == "summary" and r.get("summary"):
+                titles.setdefault("ai", r["summary"])
+            if kind not in ("user", "assistant") or not isinstance(r.get("message"), dict):
+                continue
+            if any(r.get(k) for k in ("isSidechain", "isMeta", "isCompactSummary",
+                                      "isVisibleInTranscriptOnly", "isApiErrorMessage")):
+                continue
+            meta["cwd"] = r.get("cwd") or meta["cwd"]
+            meta["branch"] = r.get("gitBranch") or meta["branch"]
+            meta["started"] = meta["started"] or r.get("timestamp")
+            meta["last"] = max(meta["last"] or "", r.get("timestamp") or "") or None
+            meta["entrypoint"] = meta["entrypoint"] or r.get("entrypoint")
+            text = CONTROL.sub("", text_of(r["message"].get("content"))).strip()
+            if kind == "user":
+                origin = r.get("origin")
+                if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+                    continue
+                if text := clean_prompt(text):
+                    turns.append([text, []])
+            elif text and text != "(no content)" and turns:
+                turns[-1][1].append(text)
+
+    turns = [(p, "\n\n".join(r)) for p, r in turns]
+    if "custom" in titles:
+        title, title_kind = titles["custom"], "custom"
+    elif "ai" in titles:
+        title, title_kind = titles["ai"], "ai"
+    elif turns:
+        title, title_kind = turns[0][0].strip().splitlines()[0][:100], "prompt"
+    else:
+        title, title_kind = "(empty)", "prompt"
+    # `claude -p` / SDK runs and sessions without a single prompt are noise in a picker.
+    hidden = not turns or (meta["entrypoint"] or "").startswith("sdk")
+    return {**meta, "title": title, "title_kind": title_kind, "turns": turns, "hidden": hidden}
+
+
+def windows(text):
+    """Split an exchange into overlapping pieces small enough to embed well."""
+    if len(text) <= WINDOW + OVERLAP:
+        return [text]
+    out, start = [], 0
+    while start < len(text) and len(out) < MAX_WINDOWS:
+        end = start + WINDOW
+        if end < len(text):
+            cut = text.rfind(" ", start + WINDOW // 2, end)
+            end = cut if cut > 0 else end
+        out.append(text[start:end])
+        start = end - OVERLAP
+    return out
+
+
+# ---------------------------------------------------------------- index
+
+def connect():
+    STATE.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(STATE / "index.db", timeout=10)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        # Rebuild from the transcripts, but keep vectors: they are slow to recompute and
+        # keyed only by their input text.
+        with db:
+            for (kind, name) in db.execute(
+                "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger') "
+                "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'turns_fts_%' AND name != 'vectors'"
+            ).fetchall():
+                db.execute(f"DROP {kind} IF EXISTS {name}")
+            db.executescript(SCHEMA)
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    return db
+
+
+def lock(name, wait=True):
+    """Hold an flock for the life of the returned file; None if busy and not waiting."""
+    f = open(STATE / name, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def drop(db, sid):
+    db.execute("DELETE FROM pieces WHERE turn IN (SELECT id FROM turns WHERE session = ?)", (sid,))
+    db.execute("DELETE FROM turns WHERE session = ?", (sid,))
+    db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+
+
+def epoch(iso):
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def store(db, sid, path, st, s):
+    drop(db, sid)
+    db.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (sid, str(path), st.st_mtime, st.st_size, s["cwd"], s["branch"], s["title"],
+         s["title_kind"], s["started"], epoch(s["last"]) or st.st_mtime, len(s["turns"]),
+         int(s["hidden"])),
+    )
+    if s["hidden"]:
+        return
+    meta = " ".join(x for x in (s["title"], s["cwd"], s["branch"]) if x)
+    db.execute("INSERT INTO turns(session, ord, prompt, reply, meta) VALUES (?, -1, '', '', ?)",
+               (sid, meta))
+    for i, (prompt, reply) in enumerate(s["turns"]):
+        turn = db.execute(
+            "INSERT INTO turns(session, ord, prompt, reply, meta) VALUES (?, ?, ?, ?, '')",
+            (sid, i, prompt, reply),
+        ).lastrowid
+        pieces = []
+        for w in windows(f"{prompt}\n\n{reply}".strip()):
+            text = "title: none | text: " + w  # EmbeddingGemma's document prompt
+            pieces.append((turn, hashlib.sha1(text.encode()).hexdigest(), text))
+        db.executemany("INSERT INTO pieces VALUES (?, ?, ?)", pieces)
+
+
+def update_text(db, quiet=True):
+    """Re-read transcripts whose size or mtime changed; forget deleted ones."""
+    files = {p.stem: p for p in (CLAUDE_DIR / "projects").glob("*/*.jsonl")}
+    known = {sid: (m, n) for sid, m, n in db.execute("SELECT id, mtime, size FROM sessions")}
+    changed = 0
+    with lock("text.lock"):
+        with db:
+            for sid in known.keys() - files.keys():
+                drop(db, sid)
+            for sid, path in files.items():
+                try:
+                    st = path.stat()
+                    if known.get(sid) == (st.st_mtime, st.st_size):
+                        continue
+                    store(db, sid, path, st, parse(path))
+                    changed += 1
+                except OSError:
+                    continue  # deleted while we were scanning
+            if MODEL:
+                db.execute("DELETE FROM vectors WHERE model != ? "
+                           "OR hash NOT IN (SELECT hash FROM pieces)", (MODEL,))
+    if not quiet:
+        print(f"text: {len(files)} sessions, {changed} re-read", file=sys.stderr)
+
+
+def embed(texts):
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"model": MODEL, "input": texts, "truncate": True}).encode()
+    req = urllib.request.Request(OLLAMA + "/api/embed", body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.load(resp)["embeddings"]
+    except urllib.error.HTTPError as e:
+        with e:
+            try:
+                detail = json.load(e).get("error", "")
+            except ValueError:
+                detail = ""
+        raise EmbedError(f"ollama: {detail or e}") from None
+    except (OSError, ValueError, KeyError) as e:
+        raise EmbedError(f"ollama at {OLLAMA}: {e}") from None
+
+
+def update_vectors(db, quiet=True):
+    if not MODEL:
+        return
+    held = lock("embed.lock", wait=False)
+    if not held:
+        return  # another indexer is already embedding
+    with held:
+        todo = db.execute(
+            "SELECT DISTINCT p.hash, p.input FROM pieces p LEFT JOIN vectors v "
+            "ON v.hash = p.hash AND v.model = ? WHERE v.hash IS NULL", (MODEL,)
+        ).fetchall()
+        started = time.monotonic()
+        for i in range(0, len(todo), BATCH):
+            batch = todo[i:i + BATCH]
+            vecs = embed([text for _, text in batch])
+            with db:
+                db.executemany("INSERT OR REPLACE INTO vectors VALUES (?, ?, ?)",
+                               [(h, MODEL, array("f", v).tobytes()) for (h, _), v in zip(batch, vecs)])
+            if not quiet:
+                done = i + len(batch)
+                print(f"\rembeddings: {done}/{len(todo)} ({time.monotonic() - started:.0f}s)",
+                      end="", file=sys.stderr)
+        if todo and not quiet:
+            print(file=sys.stderr)
+
+
+def spawn_index(*args):
+    subprocess.Popen([sys.executable, SELF, "index", "-q", *args], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- search
+
+def fts_expr(query):
+    """Any-term BM25 query; the word still being typed matches as a prefix."""
+    words = re.findall(r"\w+", query)
+    if not words:
+        return ""
+    terms = [f'"{w}"' for w in words]
+    if not query[-1].isspace():
+        terms[-1] += "*"
+    return " OR ".join(terms)
+
+
+def keyword_rank(db, query):
+    """[(session, exchange)] best first; exchange is the best-matching one."""
+    expr = fts_expr(query)
+    if not expr:
+        return []
+    best = {}
+    for sid, ord_ in db.execute(
+        "SELECT t.session, t.ord FROM turns_fts JOIN turns t ON t.id = turns_fts.rowid "
+        "WHERE turns_fts MATCH ? ORDER BY bm25(turns_fts, 1.0, 0.6, 2.0) LIMIT 5000", (expr,)
+    ):
+        best.setdefault(sid, max(ord_, 0))
+    return list(best.items())
+
+
+def semantic_rank(db, query, limit=100):
+    qv = embed(["task: search result | query: " + query])[0]
+    rows = db.execute(
+        "SELECT t.session, t.ord, v.vec FROM pieces p JOIN turns t ON t.id = p.turn "
+        "JOIN vectors v ON v.hash = p.hash AND v.model = ?", (MODEL,)
+    ).fetchall()
+    if not rows:
+        return []
+    try:
+        import numpy as np
+
+        mat = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+        scores = (mat @ np.asarray(qv, dtype=np.float32)).tolist()
+    except ImportError:
+        scores = [sum(map(operator.mul, qv, array("f", r[2]))) for r in rows]
+    best = {}
+    for (sid, ord_, _), score in zip(rows, scores):
+        if score > best.get(sid, (-2.0, 0))[0]:
+            best[sid] = (score, ord_)
+    ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[:limit]
+    return [(sid, ord_) for sid, (_, ord_) in ranked]
+
+
+def hybrid_rank(db, query):
+    """Fuse keyword and semantic rankings (reciprocal rank fusion)."""
+    keyword = keyword_rank(db, query)
+    if not MODEL or not query.strip():
+        return keyword
+    try:
+        semantic = semantic_rank(db, query)
+    except EmbedError as e:
+        print(f"{e} — showing keyword results", file=sys.stderr)
+        return keyword
+    score, where = {}, {}
+    for ranking in (keyword, semantic):
+        for rank, (sid, ord_) in enumerate(ranking):
+            score[sid] = score.get(sid, 0.0) + 1 / (RRF_K + rank)
+            if sid not in where or rank < where[sid][0]:
+                where[sid] = (rank, ord_)
+    return [(sid, where[sid][1]) for sid in sorted(score, key=lambda s: -score[s])]
+
+
+def live_panes():
+    """{session id: tmux pane} for sessions claude-tasks reports as open."""
+    try:
+        files = list(TASKS.iterdir())
+        panes = set(subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+                                   capture_output=True, text=True, timeout=2).stdout.split())
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    live = {}
+    for f in files:
+        try:
+            fields = f.read_text().rstrip("\n").split("\t")
+        except OSError:
+            continue
+        pane = "%" + f.name
+        if len(fields) >= 4 and fields[3] and pane in panes:
+            live[fields[3]] = pane
+    return live
+
+
+# ---------------------------------------------------------------- output
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def fit(s, n):
+    """Truncate or pad to n terminal columns."""
+    s = " ".join(s.split())
+    if width(s) > n:
+        out, w = "", 0
+        for c in s:
+            cw = width(c)
+            if w + cw > n - 1:
+                break
+            out, w = out + c, w + cw
+        s = out + "…"
+    return s + " " * (n - width(s))
+
+
+def ago(epoch):
+    s = int(time.time() - epoch)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit}"
+    return f"{max(s, 0)}s"
+
+
+def short_path(p):
+    return "~" + p[len(str(HOME)):] if p and (p + "/").startswith(str(HOME) + "/") else (p or "?")
+
+
+TITLE_STYLE = {"custom": "1", "ai": "0", "prompt": "3;90"}
+
+
+def rows(db, ranked=None):
+    """Picker lines: session<TAB>exchange<TAB>display. ranked=None lists all, newest first."""
+    sessions = {r[0]: r for r in db.execute(
+        "SELECT id, cwd, branch, title, title_kind, active FROM sessions WHERE hidden = 0 "
+        "ORDER BY active DESC")}
+    if ranked is None:
+        ranked = [(sid, 0) for sid in sessions]
+    here = os.environ.get("CLAUDE_SESSIONS_HERE")
+    live = live_panes()
+    out = []
+    for sid, ord_ in ranked:
+        s = sessions.get(sid)
+        if not s:
+            continue
+        _, cwd, branch, title, kind, active = s
+        if here and not (cwd == here or (cwd or "").startswith(here.rstrip("/") + "/")):
+            continue
+        mark = "\x1b[32m●\x1b[0m" if sid in live else " "
+        branch = "" if branch in (None, "HEAD") else branch
+        out.append(
+            f"{sid}\t{ord_}\t{mark} \x1b[{TITLE_STYLE.get(kind, '0')}m{fit(title, 46)}\x1b[0m  "
+            f"\x1b[36m{fit(os.path.basename(cwd or '?'), 18)}\x1b[0m "
+            f"\x1b[90m{fit(branch, 12)} {ago(active):>4}\x1b[0m"
+        )
+    return out
+
+
+def emit(lines):
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+
+
+def highlighter(query):
+    words = sorted(set(re.findall(r"\w+", query)), key=len, reverse=True)
+    if not words:
+        return lambda s: s
+    pat = re.compile(r"(?i)\b(?:" + "|".join(map(re.escape, words)) + r")\w*")
+    return lambda s: pat.sub(lambda m: f"\x1b[1;33m{m.group(0)}\x1b[22;39m", s)
+
+
+def clip(text, limit):
+    return text if len(text) <= limit else text[:limit].rstrip() + f" \x1b[90m… (+{len(text) - limit} chars)\x1b[0m"
+
+
+def preview(db, sid, start=0, query=""):
+    s = db.execute("SELECT cwd, branch, title, started, active, prompts FROM sessions WHERE id = ?",
+                   (sid,)).fetchone()
+    if not s:
+        print("Session not in the index.")
+        return
+    cwd, branch, title, started, active, prompts = s
+    hl = highlighter(query)
+    info = [short_path(cwd)]
+    if branch and branch != "HEAD":
+        info.append(branch)
+    info += [f"{prompts} prompts", f"started {(started or '?')[:10]}", f"active {ago(active)} ago"]
+    if pane := live_panes().get(sid):
+        info.append(f"\x1b[32mopen in {pane}\x1b[90m")
+    print(f"\x1b[1m{hl(title)}\x1b[0m\n\x1b[90m{'  ·  '.join(info)}\n{sid}\x1b[0m")
+    first = max(start - 1, 0)  # one exchange of context before the match
+    if first:
+        print(f"\n\x1b[90m⋯ {first} earlier exchange{'s' * (first > 1)} (scroll up: shift-↑)\x1b[0m")
+    for ord_, prompt, reply in db.execute(
+        "SELECT ord, prompt, reply FROM turns WHERE session = ? AND ord >= ? ORDER BY ord",
+        (sid, first),
+    ):
+        tag = "  \x1b[33m◂ best match\x1b[0m" if query.strip() and ord_ == start else ""
+        print(f"\n\x1b[1;34m▍You\x1b[0m{tag}\n{hl(clip(prompt, 2000))}")
+        if reply:
+            print(f"\n\x1b[1;35m▍Claude\x1b[0m\n{hl(clip(reply, 3000))}")
+
+
+# ---------------------------------------------------------------- actions
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def open_session(db, sid):
+    row = db.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
+    if not row:
+        sys.exit(f"claude-sessions: unknown session {sid}")
+    if pane := live_panes().get(sid):
+        tmux("switch-client", "-t", pane, ";", "select-window", "-t", pane, ";", "select-pane", "-t", pane)
+        return
+    cwd = row[0]
+    if not cwd or not os.path.isdir(cwd):
+        msg = f"claude-sessions: project folder {cwd} no longer exists"
+        if os.environ.get("TMUX"):
+            tmux("display-message", msg)
+        sys.exit(msg)
+    cmd = RESUME.replace("{id}", shlex.quote(sid))
+    if os.environ.get("TMUX"):
+        # Typed into a shell rather than run directly, so the window stays usable after
+        # claude exits and up-arrow brings the command back.
+        pane = tmux("new-window", "-P", "-F", "#{pane_id}", "-c", cwd).stdout.strip()
+        tmux("send-keys", "-t", pane, "-l", cmd)
+        tmux("send-keys", "-t", pane, "Enter")
+    else:
+        os.chdir(cwd)
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        os.execvp(shell, [shell, "-c", cmd])
+
+
+def copy(text):
+    if os.environ.get("TMUX"):
+        tmux("set-buffer", "-w", text)
+        return
+    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, input=text, text=True)
+            return
+
+
+def status(db):
+    q = lambda sql, *a: db.execute(sql, a).fetchone()[0]  # noqa: E731
+    visible, hidden = q("SELECT count(*) FROM sessions WHERE hidden = 0"), q("SELECT count(*) FROM sessions WHERE hidden = 1")
+    pieces = q("SELECT count(DISTINCT hash) FROM pieces")
+    print(f"sessions     {visible} shown, {hidden} hidden (no prompts or claude -p)")
+    print(f"exchanges    {q('SELECT count(*) FROM turns WHERE ord >= 0')}")
+    if MODEL:
+        done = q("SELECT count(*) FROM vectors WHERE model = ?", MODEL)
+        print(f"embeddings   {done}/{pieces} pieces with {MODEL} via {OLLAMA}")
+    else:
+        print("embeddings   off (CLAUDE_SESSIONS_MODEL=none)")
+    print(f"index        {STATE / 'index.db'} ({(STATE / 'index.db').stat().st_size / 1e6:.1f} MB)")
+    print(f"transcripts  {CLAUDE_DIR / 'projects'}")
+
+
+def picker(here):
+    if not shutil.which("fzf"):
+        sys.exit("claude-sessions: fzf not found")
+    db = connect()
+    update_text(db)
+    if MODEL:
+        spawn_index("--warm")  # embed new text and load the model before you need it
+    if here:
+        os.environ["CLAUDE_SESSIONS_HERE"] = os.getcwd()
+    me = shlex.quote(SELF)
+    keys = "C-s semantic · Enter resume · C-y copy id · C-/ preview · Esc quit"
+    binds = [
+        f"change:reload({me} search -- {{q}})+change-prompt(> )",
+        f"ctrl-s:reload({me} search --semantic -- {{q}})+change-prompt(≈ )",
+        f"enter:become({me} open {{1}})",
+        f"ctrl-y:execute-silent({me} copy {{1}})+change-border-label( Claude sessions · copied )",
+        "ctrl-/:toggle-preview",
+        "ctrl-f:preview-page-down,ctrl-b:preview-page-up",
+    ]
+    if shutil.which("claude-tasks"):
+        binds.append("ctrl-t:become(claude-tasks)")
+        keys = keys.replace(" · Esc", " · C-t tasks · Esc")
+    label = " Claude sessions" + (f" in {short_path(os.getcwd())} " if here else " ")
+    args = [
+        "fzf", "--ansi", "--disabled", "--no-sort", "--delimiter=\t", "--with-nth=3",
+        "--layout=reverse", "--border=rounded", f"--border-label={label}",
+        f"--header={keys}", "--header-first", "--info=inline-right", "--pointer=▌",
+        "--gutter= ", "--prompt=> ", "--with-shell=bash -c",
+        f"--preview={me} preview {{1}} {{2}} {{q}}",
+        "--preview-window=right,50%,wrap,border-left,<90(down,55%,wrap,border-top)",
+    ]
+    for b in binds:
+        args.append("--bind=" + b)
+    lines = rows(db)
+    subprocess.run(args, input="".join(line + "\n" for line in lines), text=True)
+
+
+def main(argv):
+    cmd, rest = (argv[0], argv[1:]) if argv and not argv[0].startswith("-") else ("", argv)
+    if cmd == "" and set(rest) <= {"--here"}:
+        return picker("--here" in rest)
+    if cmd == "hook":
+        sys.stdin.read()
+        spawn_index()
+        return
+    db = connect()
+    if cmd == "index":
+        update_text(db, quiet="-q" in rest)
+        try:
+            update_vectors(db, quiet="-q" in rest)
+            if "--warm" in rest and MODEL:
+                embed(["warm up"])
+        except EmbedError as e:
+            sys.exit(f"claude-sessions: {e}")
+    elif cmd == "search":
+        semantic = "-s" in rest or "--semantic" in rest
+        words = rest[rest.index("--") + 1:] if "--" in rest else [a for a in rest if not a.startswith("-")]
+        query = " ".join(words)
+        if not query.strip():
+            ranked = None
+        else:
+            ranked = hybrid_rank(db, query) if semantic else keyword_rank(db, query)
+        emit(rows(db, ranked))
+    elif cmd == "list":
+        emit(rows(db))
+    elif cmd == "preview" and rest:
+        start = int(rest[1]) if len(rest) > 1 and rest[1].lstrip("-").isdigit() else 0
+        preview(db, rest[0], start, " ".join(rest[2:]))
+    elif cmd == "open" and rest:
+        open_session(db, rest[0])
+    elif cmd == "copy" and rest:
+        copy(rest[0])
+    elif cmd == "status":
+        status(db)
+    else:
+        sys.exit(__doc__.split("\n\n")[1])
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
